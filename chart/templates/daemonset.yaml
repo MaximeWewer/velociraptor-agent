@@ -1,0 +1,182 @@
+{{- $fullName := include "velociraptor-agent.fullname" . }}
+{{- $state := include "velociraptor-agent.stateDir" . }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velociraptor-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "velociraptor-agent.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "velociraptor-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.clientConfig.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "velociraptor-agent.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      hostPID: {{ .Values.hostPID }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      {{- with (.Values.dnsPolicy | default (ternary "ClusterFirstWithHostNet" "" .Values.hostNetwork)) }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Deep-merge the chart overlay (writeback path, buffer, server URLs, extra) onto the
+        # base client config. The base Secret is never modified.
+        - name: config-merge
+          image: {{ .Values.clientConfig.overlay.image.repository }}:{{ .Values.clientConfig.overlay.image.tag }}{{ with .Values.clientConfig.overlay.image.digest }}@{{ . }}{{ end }}
+          imagePullPolicy: {{ .Values.clientConfig.overlay.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              yq eval-all 'select(fi==0) * select(fi==1)' \
+                /base/{{ .Values.clientConfig.secretKey }} /overlay/overlay.yaml \
+                > /merged/client.config.yaml
+          securityContext:
+            {{- include "velociraptor-agent.initSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: config-base
+              mountPath: /base
+              readOnly: true
+            - name: config-files
+              mountPath: /overlay
+              readOnly: true
+            - name: config
+              mountPath: /merged
+      containers:
+        - name: velociraptor
+          image: {{ include "velociraptor-agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/velociraptor/client.config.yaml
+            {{- if .Values.remap.enabled }}
+            - --remap
+            - /etc/velociraptor-remap/remap.yaml
+            {{- end }}
+            - --tempdir
+            - /tmp
+            - client
+            - -v
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: VELOCIRAPTOR_K8S_MODE
+              value: daemonset
+            - name: VELOCIRAPTOR_K8S_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: VELOCIRAPTOR_K8S_POD
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: VELOCIRAPTOR_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: VELOCIRAPTOR_K8S_CLUSTER
+              value: {{ .Values.identity.clusterName | quote }}
+            - name: VELOCIRAPTOR_K8S_LABELS
+              value: {{ .Values.identity.extraLabels | join "," | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- include "velociraptor-agent.securityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/velociraptor
+              readOnly: true
+            - name: config-files
+              mountPath: /etc/velociraptor-remap
+              readOnly: true
+            - name: state
+              mountPath: {{ $state }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.hostRoot.enabled }}
+            - name: host-root
+              mountPath: {{ .Values.hostRoot.mountPath }}
+              readOnly: {{ .Values.hostRoot.readOnly }}
+              mountPropagation: HostToContainer
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config-base
+          secret:
+            secretName: {{ include "velociraptor-agent.configSecretName" . }}
+            items:
+              - key: {{ .Values.clientConfig.secretKey }}
+                path: {{ .Values.clientConfig.secretKey }}
+        - name: config-files
+          configMap:
+            name: {{ $fullName }}
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpDir.sizeLimit }}
+        - name: state
+          {{- if eq .Values.writeback.type "hostPath" }}
+          hostPath:
+            path: {{ include "velociraptor-agent.writebackHostPath" . }}
+            type: DirectoryOrCreate
+          {{- else if eq .Values.writeback.type "emptyDir" }}
+          emptyDir: {}
+          {{- else }}
+          {{- fail "velociraptor-agent: writeback.type must be hostPath or emptyDir" }}
+          {{- end }}
+        {{- if .Values.hostRoot.enabled }}
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

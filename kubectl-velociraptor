@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# kubectl-velociraptor - attach a throw-away Velociraptor agent to a running pod.
+#
+# Install: put this file on your PATH (chmod +x), then `kubectl velociraptor ...`.
+#
+#   kubectl velociraptor debug POD -n NAMESPACE --config-secret [SECRET_NS/]SECRET [options]
+#   kubectl velociraptor cleanup -n NAMESPACE
+#
+# `debug` adds an EPHEMERAL CONTAINER to the pod (kubectl debug): the pod is NOT restarted,
+# memory, processes and the ephemeral filesystem stay intact. The agent shares the PID
+# namespace of the target container, enrolls a new client (hostname = pod name, labels
+# k8s-ephemeral / k8s-ns-<ns> / k8s-pod-<pod> with Server.Kubernetes.AutoLabel) and reads the
+# target's files through /proc/<pid>/root (Linux.Kubernetes.Container.Collect).
+#
+# The client config is passed as VELOCIRAPTOR_LITERAL_CONFIG from a Secret in the pod's
+# namespace (ephemeral containers cannot mount new volumes). When --config-secret lives in
+# another namespace, it is copied as `velociraptor-agent-ephemeral` (labelled, removed by
+# `cleanup`).
+#
+# An ephemeral container can not be removed: it stops when the agent exits or the pod dies.
+# Delete the throw-away clients with Server.Kubernetes.CleanupEphemeral.
+#
+# Requires kubectl >= 1.32 (kubectl debug --custom) and Kubernetes >= 1.25.
+set -euo pipefail
+
+COPY_NAME="velociraptor-agent-ephemeral"
+TMP_FILES=()
+trap 'rm -f "${TMP_FILES[@]}"' EXIT
+MANAGED_LABEL="app.kubernetes.io/managed-by=kubectl-velociraptor"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kubectl velociraptor debug POD -n NAMESPACE --config-secret [NS/]NAME [options]
+  kubectl velociraptor cleanup -n NAMESPACE
+
+debug options:
+  -n, --namespace NS        Namespace of the pod (default: current context namespace)
+  -c, --target CONTAINER    Container whose PID namespace to share (default: first container)
+  --config-secret [NS/]NAME Secret holding the client config (required)
+  --key KEY                 Key in the Secret (default: client.config.yaml)
+  --image IMAGE             Agent image (default: ghcr.io/maximewewer/velociraptor-agent:0.77.4)
+  --profile PROFILE         restricted (default): root + SYS_PTRACE + DAC_READ_SEARCH
+                            minimal: root, no added capability (Pod Security "baseline"
+                              namespaces); only reads processes running as root
+  --cluster NAME            Cluster name reported for the k8s-cluster-<name> label
+  --dry-run                 Print the kubectl commands and the container spec, change nothing
+EOF
+}
+
+die() { echo "kubectl-velociraptor: $*" >&2; exit 1; }
+
+cmd_debug() {
+  local pod="" ns="" target="" secret="" key="client.config.yaml"
+  local image="ghcr.io/maximewewer/velociraptor-agent:0.77.4" profile="restricted"
+  local cluster="" dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--namespace) ns="$2"; shift 2 ;;
+      -c|--target) target="$2"; shift 2 ;;
+      --config-secret) secret="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --image) image="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --cluster) cluster="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option $1" ;;
+      *) if [ -z "$pod" ]; then pod="$1"; else die "unexpected argument $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$pod" ] || { usage; exit 1; }
+  # Written verbatim into the container spec JSON.
+  [[ "$cluster" =~ ^[A-Za-z0-9._-]*$ ]] || die "--cluster: only letters, digits, '.', '_' and '-'"
+  [ -n "$secret" ] || die "--config-secret is required"
+  [ -n "$ns" ] || ns="$(kubectl config view --minify -o jsonpath='{..namespace}')"
+  [ -n "$ns" ] || ns=default
+
+  local src_ns="$ns" src_name="$secret"
+  if [[ "$secret" == */* ]]; then src_ns="${secret%%/*}"; src_name="${secret#*/}"; fi
+
+  if [ -z "$target" ]; then
+    target="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[0].name}')"
+  fi
+  kubectl -n "$ns" get pod "$pod" -o jsonpath='{.spec.containers[*].name}' | tr ' ' '\n' \
+    | grep -qx "$target" || die "pod $ns/$pod has no container $target"
+
+  local caps
+  case "$profile" in
+    restricted) caps='"add": ["SYS_PTRACE", "DAC_READ_SEARCH"], "drop": ["ALL"]' ;;
+    minimal) caps='"drop": ["ALL"]' ;;
+    *) die "--profile must be restricted or minimal" ;;
+  esac
+
+  # Secret in the pod namespace (copied when it lives elsewhere).
+  local use_secret="$src_name"
+  if [ "$src_ns" != "$ns" ]; then
+    use_secret="$COPY_NAME"
+    local esc_key="${key//./\\.}"
+    if [ -n "$dry" ]; then
+      echo "# copy Secret $src_ns/$src_name (key $key) -> $ns/$use_secret"
+    else
+      local tmp
+      tmp="$(mktemp)"; chmod 600 "$tmp"; TMP_FILES+=("$tmp")
+      kubectl -n "$src_ns" get secret "$src_name" -o "jsonpath={.data.$esc_key}" | base64 -d > "$tmp"
+      [ -s "$tmp" ] || die "Secret $src_ns/$src_name has no key $key"
+      kubectl -n "$ns" create secret generic "$use_secret" --from-file="$key=$tmp" \
+        --dry-run=client -o yaml | kubectl label --local -f - "$MANAGED_LABEL" -o yaml \
+        | kubectl apply -f - >/dev/null
+      echo "Copied the client config to Secret $ns/$use_secret"
+    fi
+  fi
+
+  local name
+  name="velociraptor-$(date +%s)"
+  local spec
+  spec="$(cat <<EOF
+{
+  "args": ["client", "-v", "--tempdir", "/tmp"],
+  "env": [
+    {"name": "VELOCIRAPTOR_LITERAL_CONFIG", "valueFrom": {"secretKeyRef": {"name": "$use_secret", "key": "$key"}}},
+    {"name": "VELOCIRAPTOR_K8S_MODE", "value": "ephemeral"},
+    {"name": "VELOCIRAPTOR_K8S_CLUSTER", "value": "$cluster"},
+    {"name": "VELOCIRAPTOR_K8S_TARGET_NAMESPACE", "value": "$ns"},
+    {"name": "VELOCIRAPTOR_K8S_TARGET_POD", "value": "$pod"},
+    {"name": "VELOCIRAPTOR_K8S_TARGET_CONTAINER", "value": "$target"},
+    {"name": "VELOCIRAPTOR_K8S_NODE", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}
+  ],
+  "securityContext": {
+    "runAsUser": 0, "runAsNonRoot": false, "allowPrivilegeEscalation": false,
+    "capabilities": {$caps},
+    "seccompProfile": {"type": "RuntimeDefault"}
+  }
+}
+EOF
+)"
+
+  local custom
+  custom="$(mktemp --suffix=.json)"; TMP_FILES+=("$custom")
+  printf '%s\n' "$spec" > "$custom"
+
+  local -a cmd=(kubectl -n "$ns" debug "pod/$pod" --image "$image" --target "$target"
+                --container "$name" --profile general --custom "$custom")
+  if [ -n "$dry" ]; then
+    echo "# ${cmd[*]}"; echo "$spec"; return 0
+  fi
+  "${cmd[@]}"
+  echo
+  echo "Ephemeral agent $name attached to $ns/$pod (target container $target)."
+  echo "Logs:   kubectl -n $ns logs $pod -c $name -f"
+  echo "Client: hostname $pod, labels k8s-ephemeral k8s-ns-$ns k8s-pod-$pod (Server.Kubernetes.AutoLabel)"
+}
+
+cmd_cleanup() {
+  local ns=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--namespace) ns="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unexpected argument $1" ;;
+    esac
+  done
+  [ -n "$ns" ] || die "-n NAMESPACE is required"
+  kubectl -n "$ns" delete secret -l "$MANAGED_LABEL" --ignore-not-found
+}
+
+case "${1:-}" in
+  debug) shift; cmd_debug "$@" ;;
+  cleanup) shift; cmd_cleanup "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command $1 (debug, cleanup)" ;;
+esac

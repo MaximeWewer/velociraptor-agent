@@ -1,0 +1,10 @@
+# Client configs embed the CA + enrollment nonce: never commit them
+client.config.yaml
+*.client.yaml
+secrets.yaml
+secrets.*.yaml
+writeback*.yaml
+
+# Packaged charts
+*.tgz
+.DS_Store

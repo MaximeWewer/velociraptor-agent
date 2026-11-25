@@ -1,0 +1,43 @@
+name: Linux.Kubernetes.PodLogs
+author: Maxime Wewer
+description: |
+  Container logs kept by the kubelet on this node (`/var/log/pods/<namespace>_<pod>_<uid>/<container>/*.log*`),
+  including rotated logs and logs of containers that already restarted or exited (as long
+  as the kubelet keeps them).
+
+  With the velociraptor-agent chart the host root is remapped to "/", so this reads the
+  node's /var/log/pods.
+
+type: CLIENT
+
+parameters:
+  - name: NamespaceRegex
+    type: regex
+    default: .
+  - name: PodRegex
+    type: regex
+    default: .
+  - name: ContainerRegex
+    type: regex
+    default: .
+  - name: PodLogsRoot
+    default: /var/log/pods
+  - name: Upload
+    type: bool
+    default: Y
+
+sources:
+  - precondition: SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET Logs = SELECT OSPath, Size, Mtime,
+             parse_string_with_regex(string=OSPath.Components[-3],
+               regex='^(?P<Namespace>[^_]+)_(?P<Pod>.+)_(?P<PodUID>[0-9a-f-]{36})$') AS P,
+             OSPath.Components[-2] AS Container
+        FROM glob(globs='*/*/*.log*', root=PodLogsRoot)
+        WHERE NOT IsDir
+
+      SELECT P.Namespace AS Namespace, P.Pod AS Pod, P.PodUID AS PodUID, Container,
+             OSPath, Size, Mtime,
+             if(condition=Upload, then=upload(file=OSPath)) AS Upload
+      FROM Logs
+      WHERE Namespace =~ NamespaceRegex AND Pod =~ PodRegex AND Container =~ ContainerRegex

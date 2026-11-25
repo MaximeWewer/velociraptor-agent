@@ -1,0 +1,47 @@
+name: Release Helm Chart
+
+# Publishes the chart to oci://ghcr.io/<owner>/charts once the image it points to exists:
+# after a successful Release Image run (version bump), or on demand (chart-only changes).
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Release Image]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+
+      - id: owner
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Image of appVersion is published
+        run: |
+          CORE=$(grep '^appVersion:' chart/Chart.yaml | awk '{print $2}' | tr -d '"')
+          IMG="${{ steps.owner.outputs.owner }}/velociraptor-agent"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${IMG}:pull" | jq -r .token)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" "https://ghcr.io/v2/${IMG}/manifests/${CORE}")
+          [ "$CODE" = "200" ] || { echo "ERROR: ghcr.io/${IMG}:${CORE} not published (HTTP ${CODE})" >&2; exit 1; }
+
+      - name: Stamp release date
+        id: chart
+        run: |
+          BASE=$(grep '^version:' chart/Chart.yaml | awk '{print $2}' | sed -E 's/-[0-9]{2}-[0-9]{2}-[0-9]{4}$//')
+          VERSION="${BASE}-$(date -u +'%d-%m-%Y')"
+          sed -i "s/^version: .*/version: ${VERSION}/" chart/Chart.yaml
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Package and push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm package chart/
+          helm push velociraptor-agent-${{ steps.chart.outputs.version }}.tgz oci://ghcr.io/${{ steps.owner.outputs.owner }}/charts

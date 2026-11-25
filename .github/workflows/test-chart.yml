@@ -1,0 +1,76 @@
+name: Test Chart
+
+on:
+  pull_request:
+    paths: ["chart/**", "ci/**", "ct.yaml", "Dockerfile", "kubectl-velociraptor", "docker/**", ".github/workflows/test-chart.yml"]
+  push:
+    branches: [main]
+    paths: ["chart/**", "ci/**", "ct.yaml", "Dockerfile", "kubectl-velociraptor", "docker/**", ".github/workflows/test-chart.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-chart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v5
+      - uses: helm/chart-testing-action@v2
+
+      - name: ct lint (helm lint + yamllint, every ci/*-values.yaml)
+        run: ct lint --config ct.yaml
+
+      - name: Render every documented mode
+        run: |
+          set -e
+          r() { echo "--- $*"; helm template v chart --set clientConfig.existingSecret=s "$@" > /dev/null; }
+          r
+          r --set profile=full
+          r --set writeback.type=emptyDir
+          r --set hostNetwork=false --set networkPolicy.enabled=true
+          r --set remap.enabled=false --set hostRoot.enabled=false
+          r --set serverArtifacts.enabled=false
+          r --set serverArtifacts.namespace=velociraptor
+          helm template v chart --set clientConfig.inline='Client: {}' > /dev/null
+          must_fail() { if helm template v chart "$@" > /dev/null 2>&1; then echo "::error::render should have failed: $*"; exit 1; fi; }
+          must_fail
+          must_fail --set clientConfig.existingSecret=s --set profile=privileged
+          must_fail --set clientConfig.existingSecret=s --set writeback.type=pvc
+          must_fail --set clientConfig.existingSecret=s --set hostRoot.enabled=false
+
+      - name: Docker remap file matches the chart
+        run: |
+          helm template v chart --set clientConfig.existingSecret=s --show-only templates/configmap.yaml \
+            | yq '.data["remap.yaml"]' > /tmp/remap.yaml
+          grep -v '^#' docker/remap.yaml | diff - /tmp/remap.yaml
+
+      - name: Artifacts compile (velociraptor artifacts verify)
+        run: |
+          V=$(grep -oP '^ARG VELO_VERSION=\K\S+' Dockerfile)
+          curl -fsSL "https://github.com/Velocidex/velociraptor/releases/download/${V}/velociraptor-${V}-linux-amd64.gz" | gunzip > velociraptor
+          chmod +x velociraptor
+          ./velociraptor --nobanner artifacts verify chart/files/artifacts/*.yaml
+
+      - name: Shell scripts
+        run: |
+          shellcheck kubectl-velociraptor ci/e2e.sh
+          docker compose -f docker/compose.yaml config -q
+
+  e2e:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - uses: helm/kind-action@v1
+      - name: End-to-end (server + DaemonSet + artifacts + ephemeral agent)
+        run: ./ci/e2e.sh chart-testing

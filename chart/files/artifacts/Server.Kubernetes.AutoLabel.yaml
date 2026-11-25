@@ -1,0 +1,40 @@
+name: Server.Kubernetes.AutoLabel
+author: Maxime Wewer
+description: |
+  Labels velociraptor-agent clients from their Kubernetes.Agent.Identity events:
+
+  - `k8s`, `k8s-<mode>` (`k8s-daemonset` / `k8s-ephemeral`)
+  - `k8s-cluster-<cluster>`, `k8s-node-<node>`
+  - ephemeral agents: `k8s-ns-<target namespace>`, `k8s-pod-<target pod>`
+  - the chart's `identity.extraLabels`
+
+  Labels are lowercased, other characters than [a-z0-9.-] become '-'. Labels are only
+  added, never removed. Run it as a server event artifact (GUI: Server Events).
+
+type: SERVER_EVENT
+
+sources:
+  - query: |
+      LET Clean(X) = regex_replace(source=lowcase(string=X), re='[^a-z0-9.-]+', replace='-')
+      LET Tag(Prefix, X) = if(condition=X, then=Prefix + Clean(X=X))
+
+      LET Events = SELECT ClientId, ExtraLabels, (
+               'k8s',
+               Tag(Prefix='k8s-', X=Mode),
+               Tag(Prefix='k8s-cluster-', X=Cluster),
+               Tag(Prefix='k8s-node-', X=Node),
+               Tag(Prefix='k8s-ns-', X=TargetNamespace),
+               Tag(Prefix='k8s-pod-', X=TargetPod)
+             ) AS Base
+        FROM watch_monitoring(artifact='Kubernetes.Agent.Identity')
+
+      LET CleanList(S) = SELECT Clean(X=_value) AS L
+        FROM foreach(row=split(string=S, sep=','))
+        WHERE _value
+
+      LET Labelled = SELECT ClientId,
+             filter(list=Base + CleanList(S=ExtraLabels || '').L, condition='x=>x') AS Labels
+        FROM Events
+
+      SELECT ClientId, Labels, label(client_id=ClientId, labels=Labels, op='set') AS Applied
+      FROM Labelled

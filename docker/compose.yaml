@@ -1,0 +1,69 @@
+# Velociraptor agent on a Docker host (no Kubernetes): same visibility model as the
+# DaemonSet - host PID / network / UTS namespaces, host root read-only at /host (remapped
+# to "/"), read-only rootfs, targeted capabilities (profile "restricted").
+#
+#   cp /path/to/client.config.yaml ./client.config.yaml   # from the server, never commit it
+#   docker compose up -d
+#
+# Containers are read through /proc/<pid>/root (Linux.Kubernetes.Container.Collect works
+# for Docker too when the runtime is containerd-backed; Linux.Kubernetes.Pods is k8s only).
+name: velociraptor-agent
+
+services:
+  # Merges overlay.yaml onto the client config (writeback path) into a tmpfs-like volume.
+  config-merge:
+    image: mikefarah/yq:4.44.6
+    user: "0:0"
+    read_only: true
+    entrypoint: ["sh", "-c"]
+    command:
+      - yq eval-all 'select(fi==0) * select(fi==1)' /in/client.config.yaml /in/overlay.yaml > /merged/client.config.yaml
+    volumes:
+      - ./client.config.yaml:/in/client.config.yaml:ro
+      - ./overlay.yaml:/in/overlay.yaml:ro
+      - config:/merged
+
+  agent:
+    image: ghcr.io/maximewewer/velociraptor-agent:0.77.4
+    depends_on:
+      config-merge:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    command:
+      - --config
+      - /etc/velociraptor/client.config.yaml
+      - --remap
+      - /etc/velociraptor-remap/remap.yaml
+      - --tempdir
+      - /tmp
+      - client
+      - -v
+    pid: host
+    network_mode: host
+    uts: host
+    read_only: true
+    cap_drop: [ALL]
+    # Full profile (eBPF, raw devices, active response): replace by `privileged: true`.
+    cap_add: [DAC_READ_SEARCH, SYS_PTRACE]
+    security_opt:
+      - no-new-privileges:true
+      # The runtime's default AppArmor profile denies ptrace-read of host processes.
+      - apparmor=unconfined
+    tmpfs:
+      - /tmp:size=2g
+    environment:
+      VELOCIRAPTOR_K8S_MODE: ""   # not Kubernetes: Kubernetes.Agent.Identity stays silent
+    volumes:
+      - config:/etc/velociraptor:ro
+      - ./remap.yaml:/etc/velociraptor-remap/remap.yaml:ro
+      - state:/var/lib/velociraptor
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+
+volumes:
+  config:
+  state:

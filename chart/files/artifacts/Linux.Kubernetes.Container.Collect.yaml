@@ -1,0 +1,66 @@
+name: Linux.Kubernetes.Container.Collect
+author: Maxime Wewer
+description: |
+  Collect files from inside Kubernetes containers running on this node, through the merged
+  container filesystem `/proc/<pid>/root` (no overlayfs layer walking, no pod restart).
+
+  Targets come from Linux.Kubernetes.Pods. Globs are evaluated INSIDE each container
+  (`/etc/passwd` = the container's /etc/passwd). Files are read with the `raw_file`
+  accessor: the `file` accessor resolves the `/proc/<pid>/root` magic link to the agent's
+  own root and would read the wrong file.
+
+  Symbolic links are neither collected nor followed (directories included): an absolute link
+  inside a container resolves from the agent's root (the host), not the container's.
+
+type: CLIENT
+
+parameters:
+  - name: NamespaceRegex
+    type: regex
+    default: .
+  - name: PodRegex
+    type: regex
+    default: .
+  - name: ContainerRegex
+    type: regex
+    default: .
+  - name: Globs
+    type: csv
+    default: |
+      Glob
+      /etc/passwd
+      /etc/group
+      /etc/hosts
+      /etc/resolv.conf
+      /root/.*history
+      /home/*/.*history
+      /tmp/**
+      /var/tmp/**
+      /dev/shm/**
+  - name: MaxFileSize
+    type: int
+    default: 104857600
+    description: Files larger than this are listed but not uploaded.
+  - name: Upload
+    type: bool
+    default: Y
+
+sources:
+  - precondition: SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET Targets = SELECT * FROM Artifact.Linux.Kubernetes.Pods(
+          NamespaceRegex=NamespaceRegex, PodRegex=PodRegex, ContainerRegex=ContainerRegex)
+
+      LET Files = SELECT * FROM foreach(row=Targets, query={
+          SELECT Namespace, Pod, Container, ContainerID, Pid AS ContainerPid,
+                 OSPath, Size, Mode.String AS Mode, Mtime, Atime, Ctime, Btime,
+                 OSPath.Path[len(list=RootPath):] AS ContainerPath
+          FROM glob(globs=Globs.Glob, root=RootPath, accessor='file', nosymlink=TRUE)
+          WHERE NOT IsDir AND NOT IsLink
+        })
+
+      SELECT *, if(condition=Upload AND Size <= MaxFileSize,
+                   then=upload(file=OSPath, accessor='raw_file',
+                               name=Namespace + '/' + Pod + '/' + Container + ContainerPath)
+                  ) AS Upload
+      FROM Files

@@ -1,0 +1,23 @@
+apiVersion: v2
+name: velociraptor-agent
+description: Velociraptor DFIR agent for Kubernetes - node DaemonSet with host and pod visibility
+type: application
+version: 0.77.4-25-11-2026
+appVersion: "0.77.4"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/MaximeWewer/velociraptor-agent
+sources:
+  - https://github.com/MaximeWewer/velociraptor-agent
+  - https://github.com/Velocidex/velociraptor
+keywords:
+  - velociraptor
+  - dfir
+  - forensics
+  - incident-response
+  - security
+  - agent
+maintainers:
+  - name: Maxime Wewer
+    url: https://github.com/MaximeWewer/
+annotations:
+  category: Security

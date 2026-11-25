@@ -1,0 +1,7 @@
+# Deep-merged onto client.config.yaml by the config-merge service: identity and local
+# buffer on a persistent volume (one client ID per host, kept across container restarts).
+Client:
+  writeback_linux: /var/lib/velociraptor/velociraptor.writeback.yaml
+  local_buffer:
+    filename_linux: /var/lib/velociraptor/buffer.bin
+    disk_size: 1073741824

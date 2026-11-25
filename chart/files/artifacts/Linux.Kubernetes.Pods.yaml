@@ -1,0 +1,130 @@
+name: Linux.Kubernetes.Pods
+author: Maxime Wewer
+description: |
+  Kubernetes pods, containers and processes running on this node, resolved without the
+  Kubernetes API:
+
+  - process -> pod UID + container ID from `/proc/<pid>/cgroup` (cgroup v1/v2, systemd
+    and cgroupfs drivers);
+  - container ID -> pod name, namespace, container name, image from the OCI bundle of
+    the container runtime (containerd: `/run/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/config.json`,
+    CRI-O: `/run/containers/storage/overlay-containers/<id>/userdata/config.json`).
+
+  The agent's own process is not listed: it sits at the root of its own cgroup namespace,
+  so its cgroup path (`0::/`) carries no container ID.
+
+  `RootPath` (`/proc/<pid>/root`) is the merged view of the container filesystem. Read
+  files under it with the `raw_file` accessor: the `file` accessor resolves that magic
+  link to the agent's own root (see Linux.Kubernetes.Container.Collect).
+
+  Needs the agent in the host PID namespace (velociraptor-agent DaemonSet: hostPID) and, for
+  the runtime metadata, the host root (remapped by the chart).
+
+  In an ephemeral agent (`kubectl velociraptor debug`, VELOCIRAPTOR_K8S_MODE=ephemeral) the
+  agent only shares the PID namespace of its target container: every other process is that
+  container's, and pod / namespace / container names come from the environment.
+
+type: CLIENT
+
+parameters:
+  - name: NamespaceRegex
+    type: regex
+    default: .
+  - name: PodRegex
+    type: regex
+    default: .
+  - name: ContainerRegex
+    type: regex
+    default: .
+  - name: AllProcesses
+    type: bool
+    description: One row per process. Default - one row per container (its first process).
+  - name: IncludeSandbox
+    type: bool
+    description: Include the pod sandbox ("pause") containers.
+
+sources:
+  - precondition: SELECT OS FROM info() WHERE OS = 'linux'
+    query: |
+      LET UidRe = 'pod(?P<Uid>[0-9a-f]{8}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{12})'
+
+      LET Procs = SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime,
+             read_file(filename=format(format='/proc/%d/cgroup', args=Pid)) AS CGroup
+        FROM pslist()
+
+      LET Ephemeral <= environ(var='VELOCIRAPTOR_K8S_MODE') = 'ephemeral'
+
+      LET K8sProcs <= SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime,
+             regex_replace(source=parse_string_with_regex(string=CGroup, regex=UidRe).Uid,
+                           re='_', replace='-') AS PodUID,
+             parse_string_with_regex(string=CGroup, regex='(?P<Cid>[0-9a-f]{64})').Cid AS ContainerID
+        FROM Procs
+        -- The agent has its own cgroup namespace: for processes of its own pod the path is
+        -- relative ("0::/", "/../cri-containerd-<id>.scope") and loses "kubepods" and the pod
+        -- UID. Keep anything with a container ID; the pod UID then comes from the bundle.
+        -- Containers started outside Kubernetes on the node show up as '<unknown>'.
+        WHERE CGroup =~ 'kubepods' OR CGroup =~ '[0-9a-f]{64}'
+
+      -- OCI bundle written by the runtime (first match wins).
+      LET Bundle(Cid) = SELECT * FROM foreach(row=[
+            dict(Runtime='containerd',
+                 Path='/run/containerd/io.containerd.runtime.v2.task/k8s.io/' + Cid + '/config.json'),
+            dict(Runtime='cri-o',
+                 Path='/run/containers/storage/overlay-containers/' + Cid + '/userdata/config.json')],
+          query={
+            SELECT Runtime, parse_json(data=read_file(filename=Path)).annotations AS A
+            FROM stat(filename=Path)
+          })
+        LIMIT 1
+
+      LET Meta(Cid) = SELECT Runtime,
+             get(item=A, field='io.kubernetes.cri.sandbox-namespace')
+               || get(item=A, field='io.kubernetes.pod.namespace') AS Namespace,
+             get(item=A, field='io.kubernetes.cri.sandbox-name')
+               || get(item=A, field='io.kubernetes.pod.name') AS Pod,
+             get(item=A, field='io.kubernetes.cri.container-name')
+               || get(item=A, field='io.kubernetes.container.name') AS Container,
+             get(item=A, field='io.kubernetes.cri.sandbox-uid')
+               || get(item=A, field='io.kubernetes.pod.uid') AS PodUID,
+             get(item=A, field='io.kubernetes.cri.image-name')
+               || get(item=A, field='io.kubernetes.cri-o.ImageName') AS Image,
+             get(item=A, field='io.kubernetes.cri.container-type') = 'sandbox'
+               || get(item=A, field='io.kubernetes.cri-o.ContainerType') = 'sandbox' AS Sandbox
+        FROM Bundle(Cid=Cid)
+
+      -- One runtime lookup per container, not per process.
+      LET ByContainer <= if(condition=Ephemeral, then=dict(), else=memoize(key='ContainerID', query={
+          SELECT * FROM foreach(
+            row={ SELECT ContainerID FROM K8sProcs WHERE ContainerID GROUP BY ContainerID },
+            query={ SELECT ContainerID, * FROM Meta(Cid=ContainerID) })
+        }))
+
+      -- No runtime metadata (other runtime, container already gone): keep the process, with
+      -- '<unknown>' names, so the default '.' filters still return it.
+      LET NodeRows = SELECT M.Namespace || '<unknown>' AS Namespace, M.Pod || '<unknown>' AS Pod,
+             M.Container || '<unknown>' AS Container,
+             M.Image AS Image, PodUID || M.PodUID AS PodUID, ContainerID, Pid, Ppid, Name, Exe, CommandLine,
+             Username, CreateTime, format(format='/proc/%d/root', args=Pid) AS RootPath,
+             M.Runtime || 'unknown' AS Runtime, M.Sandbox AS Sandbox
+        FROM foreach(row={
+          SELECT *, get(item=ByContainer, field=ContainerID) AS M FROM K8sProcs
+        })
+        WHERE Namespace =~ NamespaceRegex AND Pod =~ PodRegex AND Container =~ ContainerRegex
+          AND (IncludeSandbox OR NOT Sandbox)
+
+      LET EphemeralRows = SELECT environ(var='VELOCIRAPTOR_K8S_TARGET_NAMESPACE') AS Namespace,
+             environ(var='VELOCIRAPTOR_K8S_TARGET_POD') AS Pod,
+             environ(var='VELOCIRAPTOR_K8S_TARGET_CONTAINER') AS Container,
+             NULL AS Image, NULL AS PodUID, 'target' AS ContainerID, Pid, Ppid, Name, Exe,
+             CommandLine, Username, CreateTime, format(format='/proc/%d/root', args=Pid) AS RootPath,
+             'ephemeral' AS Runtime, FALSE AS Sandbox
+        FROM pslist()
+        WHERE Pid != getpid()
+          AND Namespace =~ NamespaceRegex AND Pod =~ PodRegex AND Container =~ ContainerRegex
+
+      LET Rows <= SELECT * FROM if(condition=Ephemeral, then=EphemeralRows, else=NodeRows)
+
+      -- Default: the first (lowest) PID of each container.
+      LET FirstPids <= SELECT min(item=Pid) AS P FROM Rows GROUP BY ContainerID
+
+      SELECT * FROM Rows WHERE AllProcesses OR Pid in FirstPids.P

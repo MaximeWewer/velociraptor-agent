@@ -1,0 +1,229 @@
+# Default values for velociraptor-agent.
+#
+# One agent per node (DaemonSet). With the defaults the agent sees the whole node:
+# every host process (hostPID), the host filesystem (read-only hostPath at /host, remapped
+# to "/" so built-in Linux.* artifacts work unchanged) and every container on the node
+# (/proc/<pid>/root). Read the "Security model" section of the README before installing:
+# this is remote root (read) access to every node, driven by the Velociraptor server.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: "ghcr.io"
+  # -- Multi-arch (amd64/arm64) distroless image, built from this repository's Dockerfile.
+  repository: maximewewer/velociraptor-agent
+  # -- Defaults to the chart appVersion. Use "<version>-debug" for a busybox shell.
+  tag: ""
+  # -- Pin by digest in production (overrides tag): sha256:...
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+## Client config: the Velociraptor client config (CA certificate, enrollment nonce, server
+## URLs). It holds no private key - each agent generates its own key into the writeback file -
+## but the nonce lets anyone enroll a client: keep it in a Secret.
+##
+## With the velociraptor Helm chart (MaximeWewer/velociraptor-helm), set
+## `clientConfig.export.enabled=true` there: it keeps a Secret `<fullname>-client-<org>`
+## (key client.config.yaml) up to date. Secrets cannot be mounted across namespaces: install
+## this chart in the server namespace, or replicate the Secret (reflector, ESO, kubectl).
+clientConfig:
+  # -- (Required unless `inline` is set) Existing Secret holding the client config.
+  existingSecret: ""
+  # -- Key within the Secret.
+  secretKey: client.config.yaml
+  # -- Inline client config (chart-managed Secret). Do not commit it; pass it with
+  # `--set-file clientConfig.inline=client.config.yaml`.
+  inline: ""
+  # -- Override `Client.server_urls` (e.g. the in-cluster Service when the exported config
+  # points at the public frontend). Empty keeps the config's value.
+  serverUrls: []
+  # -- Extra keys deep-merged into the `Client` section (max_poll, proxy, local_buffer...).
+  # Writeback / local buffer paths are set by the chart (see `writeback`).
+  extra: {}
+  # Init container that deep-merges the chart overlay (writeback path, server URLs, extra)
+  # onto the client config at startup. The base Secret stays untouched.
+  overlay:
+    image:
+      repository: mikefarah/yq
+      tag: "4.44.6"
+      # -- Pin by digest in production.
+      digest: ""
+      pullPolicy: IfNotPresent
+
+## Client identity. The writeback file holds the client ID and private key. It MUST survive
+## pod restarts, or every restart/rollout enrolls a new client on the server (duplicates).
+## Default: a hostPath per node, so a node keeps the same client ID across upgrades.
+writeback:
+  # -- hostPath (one identity per node, default) or emptyDir (new client at each pod start,
+  # e.g. short-lived investigations).
+  type: hostPath
+  # -- Host directory (created if missing). Holds the writeback + the local event buffer.
+  # Empty: /var/lib/velociraptor-agent/<namespace>-<fullname>, so two releases on a node (e.g.
+  # one per org) never share an identity or a buffer file.
+  hostPath: ""
+  # -- Disk buffer for events/uploads while the server is unreachable (bytes, 0 = memory only).
+  localBufferDiskSize: 1073741824
+
+## Security profile.
+##   restricted (default): read-only forensics. Root, capabilities DAC_READ_SEARCH (read any
+##     file) + SYS_PTRACE (read /proc/<pid>/{root,mem,environ} of other users' processes),
+##     everything else dropped, read-only rootfs, no privilege escalation, seccomp
+##     RuntimeDefault, AppArmor Unconfined (the container runtime's default AppArmor profile
+##     denies ptrace-read of processes outside the container).
+##   full: privileged container. Needed for eBPF event artifacts, raw device access
+##     (raw_ext4 / disk imaging), process memory dumps of protected processes, and active
+##     response (execve on the host, file deletion with hostRoot.readOnly=false).
+profile: restricted
+
+# -- Override the computed container securityContext entirely (expert use).
+securityContextOverride: {}
+
+## Host visibility.
+# -- Share the host PID namespace (see every host and container process).
+hostPID: true
+# -- Share the host network namespace. Also shares the host UTS namespace, so the client
+# reports the NODE hostname (otherwise: the pod name, which changes on every rollout) and
+# network artifacts (Linux.Network.Netstat...) show host sockets instead of the pod's.
+# NetworkPolicy does not apply to host-network pods.
+hostNetwork: true
+# -- Pod DNS policy. Empty: ClusterFirstWithHostNet with hostNetwork, else ClusterFirst.
+dnsPolicy: ""
+
+hostRoot:
+  # -- Mount the host "/" at `mountPath` (HostToContainer propagation, so container rootfs
+  # and later mounts are visible).
+  enabled: true
+  mountPath: /host
+  # -- Keep true unless active response needs to write on the host (profile full).
+  readOnly: true
+
+## Remapping (velociraptor --remap): the `file` / `auto` accessors see the host root
+## (`hostRoot.mountPath`) as "/", so built-in artifacts (Linux.Sys.Users, Linux.Syslog.*,
+## Linux.Search.FileFinder...) analyse the node, not the agent container. /proc stays the
+## agent's own procfs (same PID namespace as the host with hostPID). Other accessors are
+## shadowed (unchanged). Reading files INSIDE a container through /proc/<pid>/root needs the
+## `raw_file` accessor (the `file` accessor resolves that magic link to the agent's own "/"):
+## the Linux.Kubernetes.* artifacts of this chart do that.
+remap:
+  enabled: true
+  # -- Accessors kept as-is (shadowed). Must be known to the client: ntfs, lazy_ntfs, ssh
+  # and file_links can not be shadowed (the client refuses to start).
+  shadowAccessors:
+    - data
+    - scope
+    - zip
+    - zip_nocase
+    - gzip
+    - bzip2
+    - sparse
+    - offset
+    - ranged
+    - process
+    - raw_file
+    - ext4
+    - raw_ext4
+    - raw_ntfs
+    - mft
+    - collector
+    - collector_sparse
+    - pipe
+    - mscfb
+    - ewf
+    - vhdx
+    - vmdk
+    - smb
+    - s3
+  # -- Permissions granted to queries under remapping.
+  permissions:
+    - COLLECT_CLIENT
+    - FILESYSTEM_READ
+    - FILESYSTEM_WRITE
+    - READ_RESULTS
+    - MACHINE_STATE
+    - EXECVE
+    - NETWORK
+
+## Kubernetes identity, exposed to the agent as environment variables and reported by the
+## Kubernetes.Agent.Identity client event artifact; Server.Kubernetes.AutoLabel turns it
+## into client labels (see the README).
+identity:
+  # -- Cluster name (label k8s-cluster-<name>). Empty: no cluster label.
+  clusterName: ""
+  # -- Extra labels applied by Server.Kubernetes.AutoLabel (list of strings).
+  extraLabels: []
+
+## Server-side artifacts. The client artifacts are sent by the server at collection time:
+## the SERVER must know them. This renders the artifact pack (files/artifacts/*.yaml) into a
+## ConfigMap that the velociraptor chart loads with
+## `customArtifacts.enabled=true` + `customArtifacts.existingConfigMaps=[<name>]`.
+serverArtifacts:
+  # -- Render the ConfigMap of Kubernetes artifacts.
+  enabled: true
+  # -- Namespace of the Velociraptor server (the ConfigMap must live there). Empty: release ns.
+  namespace: ""
+  # -- ConfigMap name. Empty: <fullname>-artifacts.
+  name: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    # -- Leave headroom: collections (hashing, YARA, uploads) spike memory.
+    memory: 1Gi
+
+# -- Writable scratch space (VQL temp files; the rootfs is read-only).
+tmpDir:
+  sizeLimit: 2Gi
+
+# -- Run on every node, tainted or not: a forensic agent is useless where it is not.
+tolerations:
+  - operator: Exists
+# -- Linux binary: keep it off Windows nodes (the default toleration matches every taint).
+nodeSelector:
+  kubernetes.io/os: linux
+affinity: {}
+# -- Keeps the agent scheduled under node pressure (system-node-critical is reserved to
+# kube-system unless a ResourceQuota allows it elsewhere).
+priorityClassName: ""
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 10%
+
+terminationGracePeriodSeconds: 30
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # -- The agent does not talk to the Kubernetes API.
+  automountServiceAccountToken: false
+
+podLabels: {}
+podAnnotations: {}
+
+## NetworkPolicy: egress to the Velociraptor frontend + DNS only. Only rendered with
+## hostNetwork=false (policies do not apply to host-network pods: filter at node level then).
+networkPolicy:
+  enabled: false
+  # -- Frontend port.
+  serverPort: 8000
+  # -- `to` peers of the frontend rule (namespaceSelector/podSelector/ipBlock). Empty: any.
+  serverPeers: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: velociraptor
+  #    podSelector:
+  #      matchLabels:
+  #        app.kubernetes.io/name: velociraptor
+  extraEgress: []
+
+# -- Extra client arguments (after `client -v`).
+extraArgs: []
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

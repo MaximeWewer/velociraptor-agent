@@ -1,0 +1,90 @@
+name: Update Versions
+
+# Weekly check for the latest Velociraptor release. Bumps the Dockerfile (version + per-arch
+# sha256), the chart (appVersion, version) and the image references, then opens a PR.
+# Merging it builds the image (release-image.yml), then publishes the chart (release-helm.yml).
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+jobs:
+  update-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Latest Velociraptor release
+        id: velo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/Velocidex/velociraptor/releases/latest --jq '.tag_name')
+          [ -n "$LATEST" ] && [ "$LATEST" != "null" ] || { echo "ERROR: no latest release" >&2; exit 1; }
+          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Per-arch asset sha256 (+ glibc requirement check)
+        id: sha
+        run: |
+          set -eu
+          V="${{ steps.velo.outputs.version }}"
+          for ARCH in amd64 arm64; do
+            ASSET="velociraptor-${V}-linux-${ARCH}.gz"
+            curl -fsSL -o "$ASSET" "https://github.com/Velocidex/velociraptor/releases/download/${V}/${ASSET}"
+            echo "${ARCH}=$(sha256sum "$ASSET" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+            # distroless/base-debian13 ships glibc 2.41: fail loudly if upstream needs more.
+            NEED=$(gunzip -c "$ASSET" | strings | grep -oE '^GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+            echo "linux-${ARCH} needs ${NEED}"
+            if [ "$(printf '%s\nGLIBC_2.41\n' "$NEED" | sort -V | tail -1)" != "GLIBC_2.41" ]; then
+              echo "ERROR: ${ASSET} requires ${NEED} > GLIBC_2.41 (base image)" >&2; exit 1
+            fi
+            rm -f "$ASSET"
+          done
+
+      - name: Update files
+        run: |
+          V="${{ steps.velo.outputs.version }}"; CORE="${V#v}"
+          sed -i "s|^ARG VELO_VERSION=.*|ARG VELO_VERSION=${V}|" Dockerfile
+          sed -i "s|^ARG VELO_SHA256_AMD64=.*|ARG VELO_SHA256_AMD64=${{ steps.sha.outputs.amd64 }}|" Dockerfile
+          sed -i "s|^ARG VELO_SHA256_ARM64=.*|ARG VELO_SHA256_ARM64=${{ steps.sha.outputs.arm64 }}|" Dockerfile
+          sed -i "s/^appVersion: .*/appVersion: \"${CORE}\"/" chart/Chart.yaml
+          sed -i -E "s|velociraptor-agent:[0-9]+\.[0-9]+\.[0-9]+|velociraptor-agent:${CORE}|g" \
+            docker/compose.yaml kubectl-velociraptor README.md
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; git diff --stat; fi
+
+      - name: Chart version
+        if: steps.changes.outputs.changed == 'true'
+        id: bump
+        run: |
+          V="${{ steps.velo.outputs.version }}"
+          NEW="${V#v}-$(date -u +'%d-%m-%Y')"
+          sed -i "s/^version: .*/version: ${NEW}/" chart/Chart.yaml
+          echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Pull Request
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump Velociraptor to ${{ steps.velo.outputs.version }}"
+          title: "chore: bump Velociraptor to ${{ steps.velo.outputs.version }}"
+          body: |
+            ## Automated version update
+
+            | Component | Value |
+            |-----------|-------|
+            | Velociraptor | `${{ steps.velo.outputs.version }}` |
+            | sha256 linux-amd64.gz | `${{ steps.sha.outputs.amd64 }}` |
+            | sha256 linux-arm64.gz | `${{ steps.sha.outputs.arm64 }}` |
+            | Chart version | `${{ steps.bump.outputs.version }}` |
+
+            Merging builds and pushes the image, then publishes the chart.
+          branch: chore/update-versions
+          delete-branch: true

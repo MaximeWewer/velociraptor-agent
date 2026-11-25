@@ -1,0 +1,37 @@
+name: Server.Kubernetes.CleanupEphemeral
+author: Maxime Wewer
+description: |
+  Deletes the clients enrolled by ephemeral velociraptor-agent containers (label
+  `k8s-ephemeral`, see Server.Kubernetes.AutoLabel) that have not been seen for
+  `MaxAgeHours`. Each `kubectl velociraptor debug` enrolls a new, throw-away client.
+
+  Dry run by default: set ReallyDoIt to delete. DELETION REMOVES THE CLIENT'S COLLECTED DATA:
+  export what you need first.
+
+type: SERVER
+
+required_permissions:
+  - SERVER_ADMIN
+
+parameters:
+  - name: MaxAgeHours
+    type: int
+    default: 168
+  - name: LabelFilter
+    default: k8s-ephemeral
+  - name: ReallyDoIt
+    type: bool
+
+sources:
+  - query: |
+      LET Cutoff <= now() - MaxAgeHours * 3600
+
+      LET Stale = SELECT client_id AS ClientId, os_info.hostname AS Hostname, labels AS Labels,
+             timestamp(epoch=last_seen_at) AS LastSeen
+        FROM clients(search='label:' + LabelFilter)
+        WHERE LastSeen.Unix < Cutoff
+
+      SELECT *, if(condition=ReallyDoIt,
+                   then={ SELECT * FROM client_delete(client_id=ClientId, really_do_it=TRUE) },
+                   else='dry run') AS Deleted
+      FROM Stale

@@ -1,0 +1,5 @@
+# chart-testing lint values (ct lint renders the chart with each ci/*-values.yaml).
+clientConfig:
+  existingSecret: velociraptor-client-root
+identity:
+  clusterName: ci

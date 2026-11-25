@@ -1,0 +1,20 @@
+Velociraptor agent {{ .Chart.AppVersion }} - DaemonSet {{ include "velociraptor-agent.fullname" . }} ({{ .Release.Namespace }})
+
+Profile: {{ .Values.profile }} | hostPID: {{ .Values.hostPID }} | hostNetwork: {{ .Values.hostNetwork }} | host root: {{ if .Values.hostRoot.enabled }}{{ .Values.hostRoot.mountPath }} ({{ ternary "ro" "rw" .Values.hostRoot.readOnly }}){{ else }}off{{ end }} | remap: {{ .Values.remap.enabled }}
+Identity: writeback {{ .Values.writeback.type }}{{ if eq .Values.writeback.type "hostPath" }} ({{ include "velociraptor-agent.writebackHostPath" . }} on each node){{ end }}
+
+The namespace must allow privileged pods (Pod Security Admission):
+  kubectl label ns {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged --overwrite
+
+Status:
+  kubectl -n {{ .Release.Namespace }} get ds {{ include "velociraptor-agent.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} -c velociraptor --tail=20
+{{- if .Values.serverArtifacts.enabled }}
+
+Kubernetes artifacts: ConfigMap {{ include "velociraptor-agent.artifactsConfigMapName" . }} in namespace {{ .Values.serverArtifacts.namespace | default .Release.Namespace }}.
+Load them on the server (velociraptor chart):
+  customArtifacts.enabled=true
+  customArtifacts.existingConfigMaps={ {{- include "velociraptor-agent.artifactsConfigMapName" . -}} }
+then enable the client event artifact Kubernetes.Agent.Identity and the server event
+artifact Server.Kubernetes.AutoLabel (labels: k8s, k8s-node-<node>{{ with .Values.identity.clusterName }}, k8s-cluster-{{ . }}{{ end }}).
+{{- end }}

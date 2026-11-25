@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "velociraptor-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velociraptor-agent.labels" . | nindent 4 }}
+data:
+  # Deep-merged onto the base client config by the config-merge init container.
+  overlay.yaml: |
+    {{- include "velociraptor-agent.overlay" . | nindent 4 }}
+  # velociraptor --remap: the host root is "/" for the file/auto accessors.
+  remap.yaml: |
+    {{- include "velociraptor-agent.remap" . | nindent 4 }}

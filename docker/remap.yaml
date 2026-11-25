@@ -1,0 +1,165 @@
+# velociraptor --remap: the host root (mounted at /host) is "/" for the file/auto accessors.
+# Generated from the Helm chart (helm template ... --show-only templates/configmap.yaml).
+remappings:
+- permissions:
+  - COLLECT_CLIENT
+  - FILESYSTEM_READ
+  - FILESYSTEM_WRITE
+  - READ_RESULTS
+  - MACHINE_STATE
+  - EXECVE
+  - NETWORK
+  type: permissions
+- from:
+    accessor: file
+    prefix: /host
+  "on":
+    accessor: file
+    path_type: linux
+    prefix: /
+  type: mount
+- from:
+    accessor: file
+    prefix: /host
+  "on":
+    accessor: auto
+    path_type: linux
+    prefix: /
+  type: mount
+- from:
+    accessor: file
+    prefix: /proc
+  "on":
+    accessor: file
+    path_type: linux
+    prefix: /proc
+  type: mount
+- from:
+    accessor: file
+    prefix: /proc
+  "on":
+    accessor: auto
+    path_type: linux
+    prefix: /proc
+  type: mount
+- from:
+    accessor: data
+  "on":
+    accessor: data
+  type: shadow
+- from:
+    accessor: scope
+  "on":
+    accessor: scope
+  type: shadow
+- from:
+    accessor: zip
+  "on":
+    accessor: zip
+  type: shadow
+- from:
+    accessor: zip_nocase
+  "on":
+    accessor: zip_nocase
+  type: shadow
+- from:
+    accessor: gzip
+  "on":
+    accessor: gzip
+  type: shadow
+- from:
+    accessor: bzip2
+  "on":
+    accessor: bzip2
+  type: shadow
+- from:
+    accessor: sparse
+  "on":
+    accessor: sparse
+  type: shadow
+- from:
+    accessor: offset
+  "on":
+    accessor: offset
+  type: shadow
+- from:
+    accessor: ranged
+  "on":
+    accessor: ranged
+  type: shadow
+- from:
+    accessor: process
+  "on":
+    accessor: process
+  type: shadow
+- from:
+    accessor: raw_file
+  "on":
+    accessor: raw_file
+  type: shadow
+- from:
+    accessor: ext4
+  "on":
+    accessor: ext4
+  type: shadow
+- from:
+    accessor: raw_ext4
+  "on":
+    accessor: raw_ext4
+  type: shadow
+- from:
+    accessor: raw_ntfs
+  "on":
+    accessor: raw_ntfs
+  type: shadow
+- from:
+    accessor: mft
+  "on":
+    accessor: mft
+  type: shadow
+- from:
+    accessor: collector
+  "on":
+    accessor: collector
+  type: shadow
+- from:
+    accessor: collector_sparse
+  "on":
+    accessor: collector_sparse
+  type: shadow
+- from:
+    accessor: pipe
+  "on":
+    accessor: pipe
+  type: shadow
+- from:
+    accessor: mscfb
+  "on":
+    accessor: mscfb
+  type: shadow
+- from:
+    accessor: ewf
+  "on":
+    accessor: ewf
+  type: shadow
+- from:
+    accessor: vhdx
+  "on":
+    accessor: vhdx
+  type: shadow
+- from:
+    accessor: vmdk
+  "on":
+    accessor: vmdk
+  type: shadow
+- from:
+    accessor: smb
+  "on":
+    accessor: smb
+  type: shadow
+- from:
+    accessor: s3
+  "on":
+    accessor: s3
+  type: shadow
+
